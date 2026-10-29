@@ -15,8 +15,13 @@ def archive_bytes(extra=None):
         for name in ('update.py', 'manifest.json', 'requirements.txt'):
             target.writestr(name, b'payload')
         if extra:
-            target.writestr(extra, b'bad')
-    return stream.getvalue()
+            target.writestr(extra.replace('\\', '/'), b'bad')
+    content = stream.getvalue()
+    if extra and '\\' in extra:
+        # Windows ZipInfo normalizes backslashes when creating a ZIP. Patch
+        # the two name fields so every host tests the same malformed archive.
+        content = content.replace(extra.replace('\\', '/').encode(), extra.encode())
+    return content
 
 
 class Response(io.BytesIO):
