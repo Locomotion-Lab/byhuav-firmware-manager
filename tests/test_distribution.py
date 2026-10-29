@@ -1,12 +1,13 @@
 import hashlib
 import io
+import ssl
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 import zipfile
 
-from tools.bootstrap import install
+from tools.bootstrap import install, https_context
 
 
 def archive_bytes(extra=None):
@@ -84,3 +85,8 @@ class DistributionTests(unittest.TestCase):
     def test_http_rejected(self):
         with self.assertRaises(RuntimeError):
             install('http://example.com/file.zip', '0' * 64, self.target)
+
+    def test_tls_certificate_and_hostname_checks_stay_enabled(self):
+        context = https_context()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)

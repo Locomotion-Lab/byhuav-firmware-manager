@@ -1,9 +1,10 @@
-"""Embedded by build_release.py into the two online installers. Stdlib only."""
+"""Embedded installer; use PlatformIO's CA bundle when one is available."""
 import hashlib
 import io
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
+import ssl
 import sys
 import tempfile
 import urllib.parse
@@ -13,12 +14,25 @@ import zipfile
 MAX_BYTES = 32 * 1024 * 1024
 
 
+def https_context():
+    context = ssl.create_default_context()
+    try:
+        import certifi
+    except ImportError:
+        pass
+    else:
+        # PlatformIO's portable macOS Python may have no system OpenSSL CA
+        # path. Add its bundled roots while retaining certificate validation.
+        context.load_verify_locations(cafile=certifi.where())
+    return context
+
+
 def install(url, expected, destination):
     if urllib.parse.urlsplit(url).scheme != 'https':
         raise RuntimeError('更新包地址必须使用 HTTPS。')
     destination = Path(destination)
     print('正在获取固定版本更新包……', flush=True)
-    with urllib.request.urlopen(url, timeout=90) as response:
+    with urllib.request.urlopen(url, timeout=90, context=https_context()) as response:
         if urllib.parse.urlsplit(response.geturl()).scheme != 'https':
             raise RuntimeError('下载被重定向到非 HTTPS 地址。')
         content = response.read(MAX_BYTES + 1)
