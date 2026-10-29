@@ -68,6 +68,19 @@ class DistributionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.install(data)
 
+    def test_original_name_checked_before_windows_normalization(self):
+        data = archive_bytes('folder\\escape')
+
+        class WindowsZip(zipfile.ZipFile):
+            def infolist(self):
+                entries = super().infolist()
+                for entry in entries:
+                    entry.filename = entry.filename.replace('\\', '/')
+                return entries
+
+        with patch('tools.bootstrap.zipfile.ZipFile', WindowsZip), self.assertRaises(RuntimeError):
+            self.install(data)
+
     def test_http_rejected(self):
         with self.assertRaises(RuntimeError):
             install('http://example.com/file.zip', '0' * 64, self.target)

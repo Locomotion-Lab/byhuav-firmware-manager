@@ -27,9 +27,13 @@ def install(url, expected, destination):
     with zipfile.ZipFile(io.BytesIO(content)) as archive:
         names, total = set(), 0
         for entry in archive.infolist():
-            name = PurePosixPath(entry.filename)
-            if (name.is_absolute() or '..' in name.parts or '\\' in entry.filename
-                    or ':' in entry.filename or not name.parts or name.parts[0].startswith('.')):
+            original = entry.orig_filename
+            name = PurePosixPath(original)
+            # ZipInfo normalizes Windows separators and truncates NULs.
+            # Validate the original central-directory name before extraction.
+            if (original != entry.filename or name.is_absolute() or '..' in name.parts
+                    or '\\' in original or ':' in original or '\0' in original
+                    or not name.parts or name.parts[0].startswith('.')):
                 raise RuntimeError('更新包包含无效路径。')
             if entry.filename in names or stat.S_ISLNK(entry.external_attr >> 16):
                 raise RuntimeError('更新包包含重复路径或符号链接。')
