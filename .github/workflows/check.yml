@@ -2,6 +2,9 @@ name: Offline checks
 on:
   push:
   pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -43,5 +46,31 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          bash -n update.sh dist/install.sh
+          bash -n update.sh
+          bash -n dist/install.sh
           BYHUAV_PIO_PYTHON="$(command -v python)" bash update.sh --verify-package
+  online-entry:
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify published Windows entry without hardware access
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:BYHUAV_PIO_PYTHON = (Get-Command python).Source
+          Invoke-WebRequest 'https://github.com/Locomotion-Lab/byhuav-firmware-manager/releases/download/v0.1.0/Install.ps1' -OutFile "$env:RUNNER_TEMP/Install.ps1"
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:RUNNER_TEMP/Install.ps1" --verify-package
+          if ($LASTEXITCODE -ne 0) { throw 'Published Windows entry failed' }
+      - name: Verify published shell entry without hardware access
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL https://github.com/Locomotion-Lab/byhuav-firmware-manager/releases/download/v0.1.0/install.sh -o "$RUNNER_TEMP/install.sh"
+          BYHUAV_PIO_PYTHON="$(command -v python)" bash "$RUNNER_TEMP/install.sh" --verify-package

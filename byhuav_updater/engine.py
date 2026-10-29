@@ -114,6 +114,9 @@ class Updater:
             session['phase'] = phase
         session.update(details)
         session['updated'] = now()
+        self.records.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if os.name != 'nt':
+            self.records.chmod(0o700)
         atomic_json(self.record_dir(session) / 'update-status.json', session)
 
     def record_dir(self, session):
