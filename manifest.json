@@ -1,0 +1,26 @@
+{
+  "package_version": "migration-2.0.0-20261029",
+  "esp32": {
+    "path": "firmware/esp32/firmware.bin",
+    "size": 885520,
+    "sha256": "6f7b4fca7f379918024d06b8edeafb8d8d246b3b4dd6fadd9b1a666ff971621e",
+    "version": "2.0.0",
+    "build": "6e39ffb4"
+  },
+  "core": {
+    "path": "firmware/core/BYHUAV.bin",
+    "size": 683756,
+    "max_size": 917504,
+    "sha256": "0f5ed3a419f66a5d2eed3d9d81c665dbd0d1093e69e814b5d442f18beef544d9",
+    "version": "2.0.0",
+    "build": "95e901b4"
+  },
+  "bootloader": {
+    "path": "firmware/boot/BYHUAV_Bootloader.bin",
+    "size": 212792,
+    "max_size": 1048576,
+    "sha256": "208bedb3e1f5b3718890498a9a264d8bc4321a88e3e31d4db22001b5c16cc0d5"
+  },
+  "schema_version": 1,
+  "migration": "1.x -> supplied 2.0.0; compatible existing bootloader/partitions required"
+}

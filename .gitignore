@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+dist/
+records/
+tmp/
+# Original deliveries are retained locally, but are not part of the new tool.
+/linux-macos/
+/windows/

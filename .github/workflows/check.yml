@@ -1,0 +1,47 @@
+name: Offline checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ['3.9', '3.11']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Offline regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Verify firmware payload
+        run: python update.py --verify-package
+      - name: Verify esptool runtime
+        run: |
+          python -m pip install -r requirements.txt
+          python -m esptool version
+      - name: Build distribution
+        run: python tools/build_release.py
+      - name: PowerShell launcher syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($path in @('Update.ps1', 'dist/Install.ps1')) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
+          $env:BYHUAV_PIO_PYTHON = (Get-Command python).Source
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./Update.ps1 --verify-package
+          if ($LASTEXITCODE -ne 0) { throw 'Windows launcher failed' }
+      - name: Shell launcher syntax and launch
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bash -n update.sh dist/install.sh
+          BYHUAV_PIO_PYTHON="$(command -v python)" bash update.sh --verify-package
