@@ -1,4 +1,4 @@
-"""Read-only OS inventories. No mounting, formatting or GPIO operations."""
+"""OS inventories and serial control lines; no firmware, disk or GPIO writes."""
 import json
 import os
 from pathlib import Path
@@ -6,7 +6,7 @@ import plistlib
 import re
 import sys
 
-from .common import capture, check
+from .common import StopUpdate, capture, check
 
 SD_MODEL = 'BYHUAV SD Flash Disk'
 ESP_MODEL = 'ESP32 Firmware MSC'
@@ -73,9 +73,20 @@ def mac_usb_identity(tree):
             for child in item:
                 visit(child, identity)
         elif isinstance(item, dict):
-            if 'USB Serial Number' in item or 'USB Product Name' in item:
+            # Storage driver/interface nodes repeat the USB product name but
+            # often omit the serial number. Keep the physical parent's serial.
+            # A new physical USB device always starts a new identity, even if
+            # it has no serial, so a hub's identity is never reused for it.
+            if item.get('IOObjectClass') == 'IOUSBHostDevice' or 'USB Serial Number' in item:
                 identity = {'serial': item.get('USB Serial Number', ''),
                             'model': item.get('USB Product Name', '')}
+            if identity and 'Vendor Identification' in item and 'Product Identification' in item:
+                identity = dict(identity, media_model=model_name(
+                    item['Vendor Identification'] + ' ' + item['Product Identification']))
+            characteristics = item.get('Device Characteristics', {})
+            if identity and characteristics.get('Vendor Name') and characteristics.get('Product Name'):
+                identity = dict(identity, media_model=model_name(
+                    characteristics['Vendor Name'] + ' ' + characteristics['Product Name']))
             if item.get('BSD Name') and identity:
                 disks[item['BSD Name']] = identity
             for child in item.values():
@@ -102,7 +113,9 @@ def mac_disks():
             detail = plistlib.loads(capture(
                 ['diskutil', 'info', '-plist', partition['DeviceIdentifier']], binary=True))
             roots.append(detail.get('MountPoint'))
-        result.append(disk_record('/dev/' + name, identity.get('model') or info.get('MediaName'),
+        # The USB composite product (e.g. STM32 Mass Storage) is different
+        # from the SCSI media product (BYHUAV SD Flash Disk).
+        result.append(disk_record('/dev/' + name, identity.get('media_model') or info.get('MediaName') or identity.get('model'),
                                   identity.get('serial'), info.get('TotalSize') or info.get('DiskSize'), roots))
     return result
 
@@ -162,3 +175,22 @@ def matching_port(mac):
     ports = [p for p in serial_ports() if p.vid == 0x303A and norm_mac(p.serial_number) == mac]
     check(len(ports) == 1, '目标 ESP32 串口未恢复；请检查连接，必要时按 BOOT + RESET 进入下载模式后重试。')
     return ports[0].device
+
+
+def release_port_controls(mac):
+    """Release native USB DTR/RTS after esptool, without sending serial data."""
+    import serial
+    port = serial.Serial(port=None, baudrate=115200, timeout=0.2)
+    port.dtr = False
+    port.rts = False
+    try:
+        port.port = matching_port(mac)
+        port.open()
+        return True
+    except (serial.SerialException, OSError, StopUpdate):
+        # Re-enumeration can disconnect this handle. Only the subsequent
+        # firmware readback is authoritative about successful startup.
+        return False
+    finally:
+        if port.is_open:
+            port.close()

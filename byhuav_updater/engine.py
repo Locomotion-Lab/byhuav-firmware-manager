@@ -6,6 +6,7 @@ import queue
 import re
 import shutil
 import struct
+import sys
 import subprocess
 import threading
 import time
@@ -13,17 +14,34 @@ from datetime import datetime, timezone
 import uuid
 
 from . import VERSION
-from .common import StopUpdate, atomic_json, check, digest
+from .common import StopUpdate, atomic_json, capture, check, digest
 from . import hardware
 
 ESP_SIZE = 0x800000
 PHASES = {'checked', 'backup_running', 'backup_verified', 'esp32_flash_running',
-          'esp32_verified', 'core_copying', 'core_staged', 'core_verified',
+          'esp32_runtime_pending', 'esp32_verified', 'core_copying', 'core_staged', 'core_verified',
           'boot_copying', 'boot_staged', 'complete'}
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def tool_output_lines(stream):
+    """esptool uses backspaces, as well as newlines, for read progress."""
+    token = []
+    while True:
+        char = stream.read(1)
+        if not char:
+            break
+        if char in '\r\n\b':
+            if token:
+                yield ''.join(token) + '\n'
+                token.clear()
+        else:
+            token.append(char)
+    if token:
+        yield ''.join(token) + '\n'
 
 
 def validate_layout(content, firmware_size):
@@ -189,8 +207,10 @@ class Updater:
 
             def read():
                 try:
-                    for line in process.stdout:
+                    for line in tool_output_lines(process.stdout):
                         events.put(line)
+                except Exception as exc:
+                    events.put(exc)
                 finally:
                     events.put(None)
 
@@ -207,6 +227,8 @@ class Updater:
                         continue
                     if line is None:
                         break
+                    if isinstance(line, Exception):
+                        raise StopUpdate('读取烧录输出失败：' + str(line))
                     stream.write(line)
                     stream.flush()
                     output.append(line)
@@ -257,14 +279,88 @@ class Updater:
               and path.stat().st_size == ESP_SIZE and digest(path) == session['backup_sha256'],
               '原始 ESP32 备份校验失败，停止。')
         interrupted = session['phase'] == 'esp32_flash_running'
+        receipts = self.completed_flash_receipts(session) if interrupted else None
+        if receipts:
+            self.save(session, 'esp32_runtime_pending', esp32_write_verified=True,
+                      esp32_otadata_reset_verified=True, esp32_recovered_receipts=receipts)
+            print('[恢复] 已核对原写入、独立校验和 OTA 清理的成功记录，继续启动读回检查。')
+            self.confirm_runtime(session)
+            return
         self.save(session, 'esp32_flash_running')
         # Rewriting the same app is deliberate on recovery; never trust the
         # old backup as evidence of what a partially completed flash now holds.
         flash_sequence(lambda action, args, **kw: self.run_esptool(
             session, action, args, before='default_reset' if interrupted and action == 'write_flash' else 'no_reset', **kw),
                        self.sources()['esp32'])
+        self.save(session, 'esp32_runtime_pending', esp32_write_verified=True, esp32_otadata_reset_verified=True)
+        self.confirm_runtime(session)
+
+    def completed_flash_receipts(self, session):
+        """Recover the narrow crash window before runtime-pending was saved.
+
+        A connection failure before chip identification cannot have changed
+        flash. Any later connected write attempt invalidates the older chain.
+        Device identity and live firmware readback are checked separately.
+        """
+        chain = {'write_flash': None, 'verify_flash': None, 'erase_region': None}
+        size = self.manifest['esp32']['size']
+        for path in sorted(self.record_dir(session).glob('*.log'), key=lambda p: p.stat().st_mtime_ns):
+            action = next((a for a in chain if path.name.endswith('-' + a + '.log')), None)
+            if not action:
+                continue
+            text = path.read_text(encoding='utf-8', errors='replace')
+            if action == 'write_flash' and 'No serial data received' in text and 'Chip is ' not in text:
+                continue
+            macs = re.findall(r'MAC:\s*([0-9a-f:]+)', text, re.I)
+            identified = bool(macs) and all(hardware.norm_mac(m) == session['mac'] for m in macs)
+            receipt = {'file': path.name, 'sha256': digest(path)}
+            if action == 'write_flash':
+                chain = dict.fromkeys(chain)
+                if (identified and 'Hash of data verified.' in text
+                        and ('Wrote ' + str(size) + ' bytes') in text and 'at 0x00010000' in text):
+                    chain[action] = receipt
+            elif action == 'verify_flash':
+                chain['verify_flash'] = chain['erase_region'] = None
+                if (chain['write_flash'] and identified and '-- verify OK (digest matched)' in text
+                        and ('(' + str(size) + ') bytes @ 0x00010000') in text):
+                    chain[action] = receipt
+            elif action == 'erase_region':
+                chain[action] = None
+                if chain['write_flash'] and chain['verify_flash'] and identified and 'Erase completed successfully' in text:
+                    chain[action] = receipt
+        return list(chain.values()) if all(chain.values()) else None
+
+    def clean_macos_metadata(self, session, path):
+        """Remove only this transaction's own file metadata, retaining a copy."""
+        if sys.platform != 'darwin':
+            return
+        sidecar = path.with_name('._' + path.name)
+
+        def metadata_bytes():
+            check(not sidecar.is_symlink() and sidecar.is_file()
+                  and sidecar.stat().st_size <= 65536, '固件旁的隐藏文件不是预期的 Mac 元数据，停止。')
+            content = sidecar.read_bytes()
+            check(content[:8] == bytes.fromhex('0005160700020000'),
+                  '固件旁的隐藏文件不是 AppleDouble 元数据，停止。')
+            return content
+
+        if sidecar.exists():
+            content = metadata_bytes()
+            backup = self.record_dir(session) / 'macos-metadata'
+            backup.mkdir(exist_ok=True)
+            (backup / (uuid.uuid4().hex + '-' + path.name + '.appledouble')).write_bytes(content)
+        if path.exists():
+            check(not path.is_symlink(), '暂存固件不能是符号链接。')
+            capture(['xattr', '-c', str(path)])
+        if sidecar.exists():
+            metadata_bytes()
+            sidecar.unlink()
+        sync_directory(path.parent)
+
+    def confirm_runtime(self, session):
+        check(session['phase'] == 'esp32_runtime_pending', '尚未完成 ESP32 写入与校验。')
         deadline = time.monotonic() + 45
-        verified = False
+        verified, controls_released = False, False
         while time.monotonic() < deadline:
             try:
                 device = self.require_device(session)
@@ -275,6 +371,8 @@ class Updater:
                     break
             except (StopUpdate, OSError):
                 pass
+            if not controls_released:
+                controls_released = hardware.release_port_controls(session['mac'])
             time.sleep(1)
         check(verified, 'ESP32 写入后启动读回尚未确认。请检查固件盘是否挂载，保留记录并重新运行。')
         self.save(session, 'esp32_verified', esp32_runtime_readback_verified=True)
@@ -298,6 +396,12 @@ class Updater:
             self.save(session, prefix + '_copying', pending_name='.byhuav-' + uuid.uuid4().hex + '.pending')
         pending = folder / session['pending_name']
         check(pending.name.startswith('.byhuav-') and pending.suffix == '.pending', '暂存记录无效。')
+        for owned in (pending, target):
+            if owned.exists():
+                if owned == target:
+                    check(not owned.is_symlink() and digest(owned) == self.manifest[name]['sha256'],
+                          '已暂存固件被更改或损坏，停止。')
+                self.clean_macos_metadata(session, owned)
         present = set(folder.iterdir())
         check(present <= {pending, target} and not (pending.exists() and target.exists()),
               '更新目录出现未知或冲突文件，请保留现场并联系维护人员。')
@@ -321,6 +425,7 @@ class Updater:
             pending.rename(target)
         sync_directory(folder)
         check(digest(target) == self.manifest[name]['sha256'], '复制后校验失败，不要重启板卡。')
+        self.clean_macos_metadata(session, target)
         self.save(session, prefix + '_staged', **{prefix + '_copy_verified': True})
         print('[成功] ' + name + ' 已复制并校验；接下来按提示重启板卡。')
 
@@ -330,14 +435,19 @@ class Updater:
         name = 'bootloader' if boot else 'core'
         filename = 'BYHUAV_Bootloader.bin' if boot else 'BYHUAV.bin'
         target = device['update_dir'] / filename
+        if target.exists():
+            check(not target.is_symlink() and digest(target) == self.manifest[name]['sha256'],
+                  '已暂存固件被更改或损坏，不要重启板卡。')
+            self.clean_macos_metadata(session, target)
         contents = set(device['update_dir'].iterdir())
         check(contents <= {target}, '更新目录存在其他文件，不要重启板卡。')
         if target.exists():
             check(not target.is_symlink() and digest(target) == self.manifest[name]['sha256'],
                   '已暂存固件被更改或损坏，不要重启板卡。')
             print('\n请按顺序完成以下操作：')
-            print('1. 确认板卡有独立稳定供电；在系统中安全弹出板卡 SD 卡：' + device['sd_root'])
-            print('2. 拔掉电脑连接 U29 的维护 USB，再按设备流程重启 STM32 主控板。')
+            roots = [device['sd_root']] + [str(root) for root in device['firmware_roots']]
+            print('1. 在系统中安全弹出板卡磁盘：' + '、'.join(roots))
+            print('2. 拔掉电脑连接 U29 的维护 USB，再重启 STM32 主控板；也可断电后重新上电。')
             print('3. 保持供电，至少等待 ' + ('30' if boot else '15') + ' 秒，期间不要插回 USB。')
         else:
             print('\n暂存文件已消失。请核对实际更新结果，不会仅凭文件消失认定更新成功。')
@@ -375,11 +485,12 @@ class Updater:
     def run(self):
         self.sources()
         print('BYHUAV 板卡 1.x → 2.x 固件更新向导\n')
-        print('请停止采集、拆除桨叶、保持独立供电；每次只连接一块板卡到 U29。')
+        print('维护场景：裸板卡、未启动数据采集、独立供电。每次只连接一块板卡到 U29。')
         print('完整 Flash 备份、日志和更新记录保存在：' + str(self.records))
         session = self.start()
         actions = {'checked': self.backup, 'backup_running': self.backup,
                    'backup_verified': self.flash, 'esp32_flash_running': self.flash,
+                   'esp32_runtime_pending': self.confirm_runtime,
                    'esp32_verified': lambda s: self.stage(s, 'core'),
                    'core_copying': lambda s: self.stage(s, 'core'),
                    'core_staged': self.accept,
